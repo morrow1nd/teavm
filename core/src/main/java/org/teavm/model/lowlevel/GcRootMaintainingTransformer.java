@@ -17,9 +17,15 @@ package org.teavm.model.lowlevel;
 
 import com.carrotsearch.hppc.IntObjectMap;
 import com.carrotsearch.hppc.IntObjectOpenHashMap;
+import com.carrotsearch.hppc.IntOpenHashSet;
+import com.carrotsearch.hppc.IntSet;
+import com.carrotsearch.hppc.cursors.IntCursor;
 import com.carrotsearch.hppc.cursors.ObjectCursor;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Deque;
 import java.util.List;
 import org.teavm.common.Graph;
 import org.teavm.interop.NoGC;
@@ -44,6 +50,7 @@ import org.teavm.model.instructions.InvokeInstruction;
 import org.teavm.model.instructions.JumpInstruction;
 import org.teavm.model.instructions.RaiseInstruction;
 import org.teavm.model.util.DefinitionExtractor;
+import org.teavm.model.util.InstructionTransitionExtractor;
 import org.teavm.model.util.LivenessAnalyzer;
 import org.teavm.model.util.ProgramUtils;
 import org.teavm.model.util.TypeInferer;
@@ -63,7 +70,8 @@ public class GcRootMaintainingTransformer {
             return;
         }
         List<IntObjectMap<BitSet>> liveInInformation = findCallSiteLiveIns(program, method);
-        int maxDepth = putLiveInGcRoots(program, liveInInformation);
+        List<IntObjectMap<VariableJoint>> inputLiveness = getInputLivenessOfBlocks(program, liveInInformation);
+        int maxDepth = putLiveInGcRoots(program, liveInInformation, inputLiveness);
         if (maxDepth > 0) {
             addStackAllocation(program, maxDepth);
             addStackRelease(program, maxDepth);
@@ -124,7 +132,94 @@ public class GcRootMaintainingTransformer {
         return liveInInformation;
     }
 
-    private int putLiveInGcRoots(Program program, List<IntObjectMap<BitSet>> liveInInformation) {
+    private List<IntObjectMap<VariableJoint>> getInputLivenessOfBlocks(Program program,
+            List<IntObjectMap<BitSet>> liveInInformation) {
+        class Step {
+            private final int blockIndex;
+            private final IntObjectMap<VariableLiveness> liveness = new IntObjectOpenHashMap<>();
+            private Step(int blockIndex) {
+                this.blockIndex = blockIndex;
+            }
+        }
+        Deque<Step> worklist = new ArrayDeque<>();
+        List<IntObjectMap<VariableJoint>> inputLiveness = new ArrayList<>();
+        boolean[] hasNoCallSites = new boolean[program.basicBlockCount()];
+
+        for (int i = 0; i < program.basicBlockCount(); ++i) {
+            inputLiveness.add(new IntObjectOpenHashMap<>());
+
+            IntObjectMap<BitSet> callSiteLiveIns = liveInInformation.get(i);
+            int[] callSiteLocations = callSiteLiveIns.keys().toArray();
+            if (callSiteLocations.length == 0) {
+                hasNoCallSites[i] = true;
+                continue;
+            }
+
+            int lastCallSiteLocation = callSiteLocations[0];
+            for (int j = 1; j < callSiteLocations.length; ++j) {
+                lastCallSiteLocation = Math.max(lastCallSiteLocation, callSiteLocations[i]);
+            }
+
+            BitSet liveVars = callSiteLiveIns.get(lastCallSiteLocation);
+            Step step = new Step(i);
+            for (int j = liveVars.nextSetBit(0); j >= 0; j = liveVars.nextSetBit(j + 1)) {
+                step.liveness.put(j, VariableLiveness.LIVE);
+            }
+            worklist.addLast(step);
+        }
+
+        InstructionTransitionExtractor transitionExtractor = new InstructionTransitionExtractor();
+        while (!worklist.isEmpty()) {
+            Step step = worklist.removeFirst();
+            boolean hasChanges = false;
+
+            IntObjectMap<VariableJoint> blockInputLiveness = inputLiveness.get(step.blockIndex);
+            for (IntCursor varCursor : step.liveness.keys()) {
+                int var = varCursor.index;
+                VariableJoint joint = blockInputLiveness.get(var);
+                VariableLiveness spreadLiveness = step.liveness.get(var);
+                if (joint == null) {
+                    joint = new VariableJoint();
+                    blockInputLiveness.put(var, joint);
+                    joint.liveness = spreadLiveness;
+                    hasChanges = true;
+                } else if (spreadLiveness != joint.liveness) {
+                    joint.liveness = VariableLiveness.MIXED;
+                }
+                hasChanges = true;
+            }
+
+            if (hasNoCallSites[step.blockIndex] && hasChanges) {
+                BasicBlock block = program.basicBlockAt(step.blockIndex);
+                block.getLastInstruction().acceptVisitor(transitionExtractor);
+                for (BasicBlock successor : transitionExtractor.getTargets()) {
+                    Step next = new Step(successor.getIndex());
+                    next.liveness.putAll(step.liveness);
+                    worklist.addLast(step);
+                }
+            }
+        }
+
+        for (int i = 0; i < program.basicBlockCount(); ++i) {
+            IntObjectMap<BitSet> callSiteLiveIns = liveInInformation.get(i);
+            int[] callSiteLocations = callSiteLiveIns.keys().toArray();
+            if (callSiteLocations.length == 0) {
+                continue;
+            }
+
+            int firstCallSiteLocation = callSiteLocations[0];
+            for (int j = 1; j < callSiteLocations.length; ++j) {
+                firstCallSiteLocation = Math.min(firstCallSiteLocation, callSiteLocations[i]);
+            }
+
+
+        }
+
+        return inputLiveness;
+    }
+
+    private int putLiveInGcRoots(Program program, List<IntObjectMap<BitSet>> liveInInformation,
+            List<IntObjectMap<VariableJoint>> inputLivenessByBlock) {
         int maxDepth = 0;
         for (IntObjectMap<BitSet> liveInsMap : liveInInformation) {
             for (ObjectCursor<BitSet> liveIns : liveInsMap.values()) {
@@ -134,20 +229,69 @@ public class GcRootMaintainingTransformer {
 
         for (int i = 0; i < program.basicBlockCount(); ++i) {
             BasicBlock block = program.basicBlockAt(i);
-            List<Instruction> instructions = block.getInstructions();
             IntObjectMap<BitSet> liveInsByIndex = liveInInformation.get(i);
-            for (int j = instructions.size() - 1; j >= 0; --j) {
-                BitSet liveIns = liveInsByIndex.get(j);
-                if (liveIns == null) {
-                    continue;
-                }
-                storeLiveIns(block, j, liveIns, maxDepth);
+            if (liveInsByIndex.isEmpty()) {
+                continue;
+            }
+
+            IntObjectMap<BitSet> changedLiveInsByIndex = getChangedLiveIns(liveInsByIndex,
+                    inputLivenessByBlock.get(i));
+            int[] callSites = changedLiveInsByIndex.keys().toArray();
+            Arrays.sort(callSites);
+
+            for (int j = callSites.length - 1; i >= 0; --i) {
+                int callSiteIndex = callSites[j];
+                storeLiveIns(block, callSiteIndex, liveInsByIndex.get(callSiteIndex),
+                        changedLiveInsByIndex.get(callSiteIndex), maxDepth);
             }
         }
         return maxDepth;
     }
 
-    private void storeLiveIns(BasicBlock block, int index, BitSet liveIns, int maxDepth) {
+    private IntObjectMap<BitSet> getChangedLiveIns(IntObjectMap<BitSet> liveInsByIndex,
+            IntObjectMap<VariableJoint> inputLiveIns) {
+        BitSet changedLiveIns = new BitSet();
+        BitSet currentLiveIns = new BitSet();
+
+        for (IntCursor varCursor : inputLiveIns.keys()) {
+            int var = varCursor.index;
+            VariableJoint joint = inputLiveIns.get(var);
+            if (joint.liveness == VariableLiveness.MIXED) {
+                changedLiveIns.set(var);
+            } else {
+                currentLiveIns.set(var);
+            }
+        }
+
+        IntObjectMap<BitSet> changedLiveInsByCallSite = new IntObjectOpenHashMap<>();
+        int[] callSiteLocations = liveInsByIndex.keys().toArray();
+        Arrays.sort(callSiteLocations);
+        for (int callSiteLocation : callSiteLocations) {
+            BitSet callSiteLiveIns = new BitSet();
+            IntSet variables = new IntOpenHashSet();
+            getSetBits(currentLiveIns, variables);
+            getSetBits(liveInsByIndex.get(callSiteLocation), variables);
+
+            for (int variable : variables.toArray()) {
+                if (currentLiveIns.get(variable) != callSiteLiveIns.get(variable)) {
+                    changedLiveIns.set(variable);
+                }
+            }
+
+            changedLiveInsByCallSite.put(callSiteLocation, changedLiveIns);
+            changedLiveIns = new BitSet();
+        }
+
+        return changedLiveInsByCallSite;
+    }
+
+    private static void getSetBits(BitSet bitSet, IntSet target) {
+        for (int i = bitSet.nextSetBit(0); i >= 0; i = bitSet.nextSetBit(i + 1)) {
+            target.add(i);
+        }
+    }
+
+    private void storeLiveIns(BasicBlock block, int index, BitSet liveIns, BitSet changedLiveIns, int maxDepth) {
         Program program = block.getProgram();
         List<Instruction> instructions = block.getInstructions();
         Instruction callInstruction = instructions.get(index);
@@ -298,5 +442,15 @@ public class GcRootMaintainingTransformer {
         }
         MethodReader method = cls.getMethod(methodReference.getDescriptor());
         return method.getAnnotations().get(NoGC.class.getName()) == null;
+    }
+
+    private class VariableJoint {
+        VariableLiveness liveness;
+        int stackSlot = -1;
+    }
+
+    private enum VariableLiveness {
+        LIVE,
+        MIXED
     }
 }
