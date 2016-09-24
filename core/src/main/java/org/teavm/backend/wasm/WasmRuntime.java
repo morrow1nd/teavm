@@ -254,7 +254,7 @@ public final class WasmRuntime {
         return stack != initStack() ? stack : null;
     }
 
-    public static Address getNextStackRoots(Address address) {
+    public static Address getNextStackFrame(Address address) {
         int size = address.getInt() + 2;
         Address result = address.add(-size * 4);
         if (result == initStack()) {

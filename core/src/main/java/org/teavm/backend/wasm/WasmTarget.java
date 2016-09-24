@@ -206,9 +206,9 @@ public class WasmTarget implements TeaVMTarget {
                 Address.class, int.class, void.class), null).use();
         dependencyChecker.linkMethod(new MethodReference(WasmRuntime.class, "allocStack",
                 int.class, Address.class), null).use();
-        dependencyChecker.linkMethod(new MethodReference(WasmRuntime.class, "getStackGcRoots", Address.class),
+        dependencyChecker.linkMethod(new MethodReference(WasmRuntime.class, "getStackTop", Address.class),
                 null) .use();
-        dependencyChecker.linkMethod(new MethodReference(WasmRuntime.class, "getNextStackRoots", Address.class,
+        dependencyChecker.linkMethod(new MethodReference(WasmRuntime.class, "getNextStackFrame", Address.class,
                 Address.class), null).use();
         dependencyChecker.linkMethod(new MethodReference(WasmRuntime.class, "getStackRootCount", Address.class,
                 int.class), null).use();
